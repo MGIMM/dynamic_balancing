@@ -111,6 +111,68 @@ class OptimalTransportBalancing():
         eta_ring = self.w * sum_nn_w_ring
         return eta_ring *self.n/self.m
     
+class MMDBalancing():
+    def __init__(self,
+                 xi, xi_ring,
+                 w = None, w_ring = None,
+                 sigma = 1, D = 500,
+                 k = None, KXX = None, KXY = None, KYY = None,
+                 dev = "cuda:0"):
+        # init device
+        self.dev = dev
+        # init support of source and target measures
+        self.xi = xi.to(self.dev) 
+        self.xi_ring = xi_ring.to(self.dev)
+        self.n,self.d = xi.shape
+        self.m = xi_ring.shape[0]
+        # init weights of source and target measures
+        if w is not None:
+            self.w = w.to(self.dev)
+        else:
+            self.w = torch.ones(self.n, device =self.dev)
+        if w_ring is not None:
+            self.w_ring = w_ring.to(self.dev)
+        else:
+            self.w_ring = torch.ones(self.m, device =self.dev)
+        # init kernel matrices, when not provided, Gaussian kernel with random Fourier features is implemented
+        if (KXX and KXY and KYY) is not None:
+            self.KXX,self.KXY,self.KYY = KXX,KXY,KYY
+        else:
+            W = torch.normal(0,sigma,(D,self.d), device = self.dev)
+            theta = torch.rand(D, device  = self.dev)*2*torch.pi
+            Phi_X = torch.zeros((self.n,D), device = self.dev)
+            Phi_Y = torch.zeros((self.m,D), device = self.dev)
+            for j in range(D):
+                Phi_X[:,j] = torch.cos(torch.matmul(W[j,:].T,self.xi.T) + theta[j])
+                Phi_Y[:,j] = torch.cos(torch.matmul(W[j,:].T,self.xi_ring.T) + theta[j])
+            
+            self.KXX = torch.matmul(Phi_X,Phi_X.T)
+            self.KYY = torch.matmul(Phi_Y,Phi_Y.T)
+            self.KXY = torch.matmul(Phi_X,Phi_Y.T)
+        
+        self.alpha = torch.rand(self.n,device = self.dev,requires_grad=True)
+            
+        
+        
+        
+        
+    def get_weights(self, 
+           lambda_l2 = 1e-1,
+           lambda_RKHS = 1e2,
+           ):
+                
+        #self.weights = torch.matmul(self.KXX,self.alpha)
+        
+        
+      #direct solves
+        y = self.w_ring.type(torch.cdouble)
+        KXX = self.KXX.type(torch.cdouble)
+        KXX_2 = torch.matmul(KXX.T,KXX)
+        KXY = self.KXY.type(torch.cdouble)
+        self.alpha = torch.matmul(torch.matmul(torch.linalg.inv(torch.matmul(KXX.T, KXX)+lambda_RKHS*KXX + lambda_l2*KXX_2),KXY),y)
+        self.weights = torch.real(torch.matmul(KXX,self.alpha))
+        return self.weights
+    
 dev = "cuda:0"    
 class Deep_GIPW():
     def __init__(self, xi, xi_ring, w = None, w_ring = None, epsilon = 1e-8, dev = dev, test_split_ratio = 0.2, bootstrap_multiplier = 2):
@@ -221,5 +283,158 @@ class Deep_GIPW():
             train_loss_trace.append(current_train_loss.to("cpu").detach().numpy())
         return train_loss_trace, test_loss_trace
         
+class Adversarial_Balancing():
+    def __init__(self,
+                 source_sample,
+                 target_sample,
+                 source_weight = None,
+                 target_weight = None):
+        """
+        Attributes
+        ----------
+        source_sample: tensor
+        Support of the source measure.
         
+        target_sample: tensor
+        target of the source measure.
         
+        source_weight: tensor/np.array or None
+        Weights of the source weighted empirical measure, i.e., 
+        source measure = \frac{1}{n} \sum_{i=1}^{n} source_weight[i] \delta_{source_sample[i]}. 
+        When not assigned, the weight 1 is being implemented.
+        
+        target_weight: tensor/np.array or None
+        Weights of the target weighted empirical measure, i.e., 
+        $$
+        target measure = \frac{1}{m} \sum_{j=1}^{m} target_weight[j] \delta_{target_sample[j]}. 
+        $$
+        When not assigned, the weight 1 is being implemented.
+        """
+        # use GPU when possible
+        if torch.cuda.is_available():  
+            dev = "cuda:0" 
+        else:  
+            dev = "cpu"  
+        self.dev = torch.device(dev)
+        # xi denotes the source measure
+        # xi_ring denotes the target measure
+        with torch.no_grad():
+            self.xi = source_sample.clone().to(self.dev)
+            self.xi_ring = target_sample.clone().to(self.dev)
+            if source_weight:
+                self.w = source_weight.clone().to(self.dev)
+            else:
+                self.w = torch.ones(len(source_sample)).clone().to(self.dev)
+            if target_weight:
+                self.w_ring = target_weight.clone().to(self.dev)
+            else:
+                self.w_ring = torch.ones(len(target_sample)).to(self.dev)
+        self.n  = len(self.xi)
+                
+  
+            
+    def train_loop(self,
+                   model_IPM,
+                  model_reweighting,
+                  optimizer_IPM,
+                  optimizer_reweighting,
+                  IPM_steps = 1,
+                  reweight_steps = 1,
+                  lambda_l2_weight = 1e-1,
+                  lambda_l2_IPM = 1e-1,
+                  lambda_l1_IPM = 1e-1,
+                  ):
+        for t in range(IPM_steps):
+            with torch.no_grad():
+                weights = model_reweighting(self.xi).clone()
+            weights.to(self.dev)
+            mean_source = torch.mean(model_IPM(self.xi)*weights*self.w)
+            #mean_source = torch.mean(model_IPM(self.xi)*weights/weights.sum()*self.w)
+            mean_target = torch.mean(model_IPM(self.xi_ring)*self.w_ring)
+            loss_IPM = -torch.abs(mean_source - mean_target)
+            # # l2-regularization
+            # lambda_l2_IPM = 1e2
+            # for p in model_IPM.parameters():
+            #     l2 += p.square().sum()
+            #loss_IPM += lambda_l2_IPM * model_IPM(self.xi).square().mean() 
+            loss_IPM_reg = loss_IPM + lambda_l2_IPM * (model_IPM(self.xi).square()*self.w).mean() 
+            loss_IPM_reg +=  lambda_l1_IPM*(model_IPM(self.xi_ring).square()*self.w_ring).mean()
+            # Backpropagation
+            optimizer_IPM.zero_grad()
+            loss_IPM_reg.backward()
+            optimizer_IPM.step() 
+            
+            #shaker = ParameterShaker(self.n)
+            #model_IPM.apply(shaker)
+        # optimization for weight function estimation    
+        
+        for t in range(reweight_steps):
+            with torch.no_grad():
+                mean_target_ = torch.mean(model_IPM(self.xi_ring)*self.w_ring).clone()
+                values = model_IPM(self.xi).clone()
+            mean_source_ =  torch.mean(values*model_reweighting(self.xi)*self.w)
+            #mean_source_ =  torch.mean(values*model_reweighting(self.xi)/model_reweighting(self.xi).sum()*self.w)
+            loss_reweighting = torch.abs(mean_source_ - mean_target_)
+            
+            #loss_reweighting_reg = loss_reweighting + lambda_l2_weight * model_reweighting(self.xi).square().mean() 
+            loss_reweighting_reg = loss_reweighting + lambda_l2_weight * (model_reweighting(self.xi).square()*self.w).mean() 
+            
+            optimizer_reweighting.zero_grad()
+            loss_reweighting_reg.backward()
+            optimizer_reweighting.step() 
+            #clipper = ParameterClipper()
+            #model_reweighting.apply(clipper)
+            
+            #shaker = ParameterShaker(self.n)
+            #model_reweighting.apply(shaker)
+        return loss_reweighting
+    
+   
+    
+    
+            
+
+def get_split_ind(n,K = 3):
+    I_n = torch.arange(n, dtype = float)
+    
+    rand_ind_n = torch.multinomial(I_n,len(I_n),replacement = False)
+    num_folds_n = int(n/K)
+    Ind = []
+    for i in range(K):
+        if (i+1)*num_folds_n <= n:
+            Ind.append(list(rand_ind_n[i*num_folds_n:(i+1)*num_folds_n].detach().numpy()))
+        else:
+            Ind.append(list(rand_ind_n[i*num_folds_n:].detach().numpy()))
+    
+    Ind_split = []
+    for i in range(K):
+        list_n = []
+        for j in range(n):
+            if j >= i*num_folds_n and j < (i+1)*num_folds_n:
+                pass
+            else:
+                list_n.append(rand_ind_n[j].item())
+            
+        Ind_split.append(list_n)
+    return Ind_split,Ind
+
+
+def get_X_natural(X,X_ring_0, B = 3):
+    T = len(X) -1 
+    A_ring = torch.zeros((T,m*B,1))
+    X_ring = X.clone()
+    _X_ring = X.clone()
+    
+    # covariate shifts
+    _X_ring[0] = X_ring_0.clone()
+    X_ring[0] = X_ring_0.clone()
+    
+    for b in range(B-1):
+        X_ring = torch.cat((X_ring,_X_ring), dim = 1)
+    
+        
+    for t in range(T):
+        A_ring[t] = pi_ring(X_ring[t],torch.tensor([t]))+ torch.normal(0,0.3,(m*B,1))
+    X_ring_natural = torch.cat((X_ring[0:-1], A_ring),dim = 2)
+    return X_ring_natural,X_ring,A_ring
+
